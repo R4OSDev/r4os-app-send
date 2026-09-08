@@ -113,8 +113,17 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     }
 
     const file_size: usize = @intCast(info.size);
-    const sum = checksumFile(&ctx, path_z, file_size) orelse {
-        ctx.write("SEND read: failed\r\n");
+    const allocator = r4_app.allocator() orelse {
+        ctx.write("SEND: snapshot memory unavailable\r\n");
+        return 1;
+    };
+    const snapshot = allocator.alloc(u8, file_size) catch {
+        ctx.write("SEND: snapshot allocation failed\r\n");
+        return 1;
+    };
+    defer allocator.free(snapshot);
+    const sum = loadSnapshot(&ctx, path_z, snapshot) orelse {
+        ctx.write("SEND read: failed or source size changed\r\n");
         return 1;
     };
 
@@ -141,14 +150,15 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
             ctx.printU64(options.retries + 1);
             ctx.write("\r\n");
         }
-        const result = sendOnce(&ctx, options, path_z, file_size, sum, header);
+        const result = sendOnce(&ctx, options, snapshot, sum, header);
         if (result == 0) return 0;
         if (attempt < options.retries) ctx.write("SEND retry: next\r\n");
     }
     return 1;
 }
 
-fn sendOnce(ctx: *const App, options: Options, path_z: [*:0]const u8, file_size: usize, sum: u32, header: []const u8) i32 {
+fn sendOnce(ctx: *const App, options: Options, snapshot: []const u8, sum: u32, header: []const u8) i32 {
+    const file_size = snapshot.len;
     ctx.write("SEND connect ");
     writeIpv4(ctx, options.target_ip);
     ctx.write(":");
@@ -210,14 +220,7 @@ fn sendOnce(ctx: *const App, options: Options, path_z: [*:0]const u8, file_size:
         @memcpy(first_buf[0..header.len], header);
         const prefix_cap = first_buf.len - header.len;
         const prefix_len = @min(prefix_cap, file_size);
-        if (prefix_len != 0) {
-            const got_prefix = ctx.fileReadAt(path_z, 0, first_buf[header.len .. header.len + prefix_len]);
-            if (got_prefix < 0 or got_prefix != @as(i32, @intCast(prefix_len))) {
-                ctx.write("SEND read: failed offset=0\r\n");
-                _ = ctx.tcpCloseService(conn_id);
-                return 1;
-            }
-        }
+        @memcpy(first_buf[header.len..][0..prefix_len], snapshot[0..prefix_len]);
         const first_len = header.len + prefix_len;
         const first_written = ctx.tcpWriteService(conn_id, first_buf[0..first_len]);
         if (first_written < 0 or first_written != @as(i32, @intCast(first_len))) {
@@ -228,20 +231,11 @@ fn sendOnce(ctx: *const App, options: Options, path_z: [*:0]const u8, file_size:
         offset = prefix_len;
     }
 
-    var chunk_buf: [MAX_TCP_CHUNK]u8 = undefined;
     while (offset < file_size) {
-        const want = @min(chunk_buf.len, file_size - offset);
-        const got_chunk = ctx.fileReadAt(path_z, @intCast(offset), chunk_buf[0..want]);
-        if (got_chunk < 0 or got_chunk != @as(i32, @intCast(want))) {
-            ctx.write("SEND read: failed offset=");
-            ctx.printU64(offset);
-            ctx.write("\r\n");
-            _ = ctx.tcpCloseService(conn_id);
-            return 1;
-        }
-        const chunk = chunk_buf[0..@intCast(got_chunk)];
+        const want = @min(MAX_TCP_CHUNK, file_size - offset);
+        const chunk = snapshot[offset..][0..want];
         const written = ctx.tcpWritePacedService(conn_id, chunk, control_wait_ticks);
-        if (written < 0 or written != got_chunk) {
+        if (written < 0 or written != @as(i32, @intCast(chunk.len))) {
             ctx.write("SEND write: failed offset=");
             ctx.printU64(offset);
             ctx.write("\r\n");
@@ -448,18 +442,17 @@ fn baseName(path: []const u8) []const u8 {
     return if (name.len == 0) DEFAULT_REMOTE_NAME else name;
 }
 
-fn checksumFile(ctx: *const App, path: [*:0]const u8, size: usize) ?u32 {
-    var out: u32 = 0;
-    var offset: usize = 0;
-    var buf: [MAX_TCP_CHUNK]u8 = undefined;
-    while (offset < size) {
-        const want = @min(buf.len, size - offset);
-        const got = ctx.fileReadAt(path, @intCast(offset), buf[0..want]);
-        if (got < 0 or got != @as(i32, @intCast(want))) return null;
-        out = checksumUpdate(out, buf[0..@intCast(got)]);
-        offset += @intCast(got);
+// One bounded read under the filesystem request gate produces the bytes
+// used by the header, all sends, retries and resume offsets.
+fn loadSnapshot(ctx: *const App, path: [*:0]const u8, snapshot: []u8) ?u32 {
+    if (snapshot.len > MAX_FILE) return null;
+    if (snapshot.len != 0) {
+        const got = ctx.fileReadAt(path, 0, snapshot);
+        if (got < 0 or got != @as(i32, @intCast(snapshot.len))) return null;
     }
-    return out;
+    const after = ctx.fileInfo(path) orelse return null;
+    if (after.is_dir != 0 or after.size != snapshot.len) return null;
+    return checksumUpdate(0, snapshot);
 }
 
 fn checksumUpdate(seed: u32, data: []const u8) u32 {
@@ -523,7 +516,9 @@ fn parseUsize(value: []const u8) ?usize {
     var out: usize = 0;
     for (value) |ch| {
         if (ch < '0' or ch > '9') return null;
-        out = out * 10 + @as(usize, ch - '0');
+        const digit: usize = ch - '0';
+        if (out > (@import("std").math.maxInt(usize) - digit) / 10) return null;
+        out = out * 10 + digit;
     }
     return out;
 }

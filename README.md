@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.1`
+- Version: `0.1.2`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/SEND.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -38,3 +38,9 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+
+SEND 0.1.2 reads at most 512 KB once into a heap-owned snapshot. The
+header checksum, normal transfer, retries and resumed suffix use the same
+immutable bytes. A source size change during capture rejects the attempt.
+Decimal ACK and CONT values are checked for overflow before arithmetic.

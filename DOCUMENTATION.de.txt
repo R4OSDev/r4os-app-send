@@ -29,3 +29,12 @@ Contract:
 - App-Klasse: `console`
 - Platform-API-Imports: `R4SYS:Query:1`, `R4NET:Query:1`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\SEND.R4X`
+
+
+Stand 0.78.60 / SEND 0.1.2
+-------------------------
+Die maximal 512 KB grosse Quelldatei wird einmal in einen Heap-Snapshot
+gelesen. Vorabpruefsumme, Versand, Wiederholungen und Resume verwenden genau
+diese Bytes. Ein geaenderter Dateiumfang beim Einlesen wird abgewiesen.
+ACK- und CONT-Dezimalwerte werden vor Multiplikation/Addition auf Ueberlauf
+geprueft. Der bestehende R4SEND1-/R4SEND2-Vertrag bleibt erhalten.
