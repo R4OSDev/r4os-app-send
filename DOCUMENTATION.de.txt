@@ -27,7 +27,7 @@ Der Pfad ist relativ zum Workspace-Root und folgt dem standardmaessigen
 Contract:
 - Entry-Modus: `app` gemaess `module.R4MF`
 - App-Klasse: `console`
-- Platform-API-Imports: `R4SYS:Query:1`, `R4NET:Query:1`
+- Platform-API-Imports gemaess module.R4MF mit Query2:2
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\SEND.R4X`
 
 
@@ -38,3 +38,51 @@ gelesen. Vorabpruefsumme, Versand, Wiederholungen und Resume verwenden genau
 diese Bytes. Ein geaenderter Dateiumfang beim Einlesen wird abgewiesen.
 ACK- und CONT-Dezimalwerte werden vor Multiplikation/Addition auf Ueberlauf
 geprueft. Der bestehende R4SEND1-/R4SEND2-Vertrag bleibt erhalten.
+
+
+API-Migration0.90.70
+-------------------
+Das normale Modul verwendet R4XStart2 und das Generation2-SDK-Profil.
+Die geordneten Query2-Importe und die Modulversion stehen in module.R4MF.
+Der Zielpfad und die bestehende Full-Profilzuordnung folgen diesem Manifest.
+
+Die gemeinsame Argumentgrammatik prueft den gesamten UTF8-Text vor Effekten.
+Ein fuehrendes -4 beziehungsweise -6 waehlt die Adressfamilie. IPv6-Literale
+unterstuetzen den ausdruecklichen numerischen Scope fuer linklokale Ziele.
+Hostnamen verwenden standardmaessig die konfigurierte A-Resolverfolge und
+mit -6 die AAAA-Resolverfolge. DNS-Antwortseiten werden vollstaendig gelesen
+und ihre Leihe vor dem Verwenden freigegeben.
+
+network_stream.Session bindet wirkliche TCPSVC-Faehigkeiten sowie Provider,
+Socket und Generation. StreamTransfer erhaelt den bestaetigten Praefix,
+die genaue Abschlussursache und eine gemeinsame absolute Clockfrist.
+Bekanntes WouldBlock erlaubt Fortsetzung innerhalb dieser Frist. Unklare
+RPC-/Recordabschluesse beenden den Schritt mit erhaltenem bekanntem Praefix.
+Socket-Close besitzt eine getrennte begrenzte250-ms-Bereinigungsfrist.
+Fehlende Quittungen und verbleibende Socketbesitzer fuehren zum Fehlerexit.
+
+Die Ausgabe verwendet die wirklichen Start2-stdio-Bindungen. Kurze Writes
+werden innerhalb einer gemeinsamen2-s-Ausgabefrist fortgesetzt. Der defekte
+Sink beendet weitere Ausgabe und fuehrt zum Fehlerexit. Uebernommene
+Pipereferenzen werden einzeln geschlossen. Consoleausgabe behaelt ihren
+bestehenden Handoff-Vertrag. Ownerpruefungen stehen im Migrationsbeleg.
+
+SEND behaelt R4SEND1/R4SEND2, Remote-Dateiname, additive U32-Pruefsumme,
+das512-KB-Snapshotlimit sowie die Optionen /RESUME und /RETRY. Ein Snapshot
+wird mit StreamTransfer vollstaendig gelesen. Breite Metadaten samt Revision
+werden vor und nach dem Lesen verglichen. Eine gemeinsame30-s-Frist umfasst
+Snapshot, DNS, Verbindung, Steuerantworten, Daten und angeforderte Versuche.
+
+Steuerantworten werden gepuffert bis CRLF gesammelt. Ein ausdrueckliches EOF
+schliesst auch einen letzten ungerahmten ACK ab. Gepufferte Suffixe bleiben
+fuer folgende Phasen erhalten. Ein ungerahmtes CONT einer alten Gegenstelle
+besitzt keine eindeutige Zahlengrenze. Die migrierte Gegenstelle schliesst
+CONT, OK und ERR mit CRLF ab. Alte SEND-Verbraucher trimmen diesen Abschluss.
+Ein alter RECV mit offenem ungerahmtem CONT muss fuer Resume aktualisiert
+werden. Dateiheader, Pruefsumme und Nutzdaten behalten ihren bisherigen Inhalt.
+
+Eine unquittierte Header-/Datensendung beziehungsweise fehlende ACK beendet
+einen normalen Versuch. Ein ausdruecklich angefordertes /RESUME darf ueber
+die vorhandene Groessen-/Pruefsummenabstimmung neu ansetzen. Der gemeinsame
+Fristrest begrenzt alle Versuche. /RETRY allein wiederholt eine unbestaetigte
+Dateiwirkung automatisch erst nach ausdruecklicher Resumeabstimmung.

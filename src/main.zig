@@ -1,14 +1,13 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
-const MAX_TCP_CHUNK: usize = r4os.abi.net_service_tcp_write_max;
 const MAX_HEADER: usize = 128;
 const MAX_FILE: usize = 512 * 1024;
-const CONTROL_WAIT_MS: u64 = 3000;
 const DEFAULT_REMOTE_NAME = "R4SEND.BIN";
 
 const Options = struct {
     target_text: []const u8,
-    target_ip: [4]u8,
+    target: r4os.abi.NetworkEndpoint,
     port: u16,
     path: []const u8,
     remote_name: []const u8,
@@ -18,78 +17,60 @@ const Options = struct {
 };
 
 const App = struct {
+    app: *r4os.App2,
     sys: r4os.r4sys.Context,
-    net: r4os.r4net.Context,
-
-    fn init(r4_app: *r4os.App) ?App {
-        return .{
-            .sys = r4_app.system(),
-            .net = r4_app.networkLowLevel() orelse return null,
-        };
-    }
-
-    fn argsRaw(self: *const App) [*:0]const u8 {
-        return self.sys.argsRaw();
-    }
+    output: *r4os.launch_io.Output,
+    network: *r4os.network_stream.Session,
+    budget: *r4os.rpc_budget.Budget,
+    args: []const u8,
+    family: u32,
 
     fn write(self: *const App, value: []const u8) void {
-        self.sys.write(value);
+        self.output.write(value);
     }
-
-    fn putc(self: *const App, ch: u8) void {
-        self.sys.putc(ch);
-    }
-
     fn printU64(self: *const App, value: u64) void {
-        self.sys.printU64(value);
+        self.output.number(value);
     }
-
-    fn ticksFromMilliseconds(self: *const App, ms: u64) u64 {
-        return self.sys.ticksFromMilliseconds(ms);
-    }
-
     fn fileInfo(self: *const App, path: [*:0]const u8) ?r4os.abi.FileInfo {
-        return self.sys.fileInfo(path);
-    }
-
-    fn fileReadAt(self: *const App, path: [*:0]const u8, offset: u32, out: []u8) i32 {
-        return self.sys.fileReadAt(path, offset, out);
-    }
-
-    fn netDnsResolveService(self: *const App, name_value: []const u8, out: *[4]u8) i32 {
-        return self.net.netDnsResolveService(name_value, out);
-    }
-
-    fn netDnsResultName(self: *const App, result: i32) []const u8 {
-        return self.net.netDnsResultName(result);
-    }
-
-    fn tcpConnectService(self: *const App, a: u8, b: u8, c: u8, d: u8, port: u16) i32 {
-        return self.net.tcpConnectService(a, b, c, d, port);
-    }
-
-    fn tcpWriteService(self: *const App, handle: u32, data: []const u8) i32 {
-        return self.net.tcpWriteService(handle, data);
-    }
-
-    fn tcpWritePacedService(self: *const App, handle: u32, data: []const u8, wait_ticks: u64) i32 {
-        return self.net.tcpWritePacedService(handle, data, wait_ticks);
-    }
-
-    fn tcpReadWaitService(self: *const App, handle: u32, out: []u8, wait_ticks: u64) i32 {
-        return self.net.tcpReadWaitService(handle, out, wait_ticks);
-    }
-
-    fn tcpCloseService(self: *const App, handle: u32) i32 {
-        return self.net.tcpCloseService(handle);
+        return switch ((r4os.Files{ .sys = self.sys }).info(.{ .ptr = path, .len = @intCast(std.mem.span(path).len) })) {
+            .value => |value| value,
+            else => null,
+        };
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    const ctx = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    const args = trim(zSlice(ctx.argsRaw()));
-    const options = parseOptions(&ctx, args) orelse {
-        usage(&ctx);
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    var output: r4os.launch_io.Output = undefined;
+    if (r4os.launch_io.Output.init(app, &output) != 0) return 1;
+    var selected_family: u32 = 0;
+    const args = r4os.network_stream.arguments(app.args(), &selected_family) orelse {
+        output.write("SEND: invalid argument grammar\r\n");
+        _ = output.close();
+        return 1;
+    };
+    var budget = r4os.rpc_budget.Budget.fromTimeout(output.clock.read, .{ .kind = 1, .nanoseconds = 30_000_000_000 }) catch {
+        _ = output.close();
+        return 1;
+    };
+    var network: r4os.network_stream.Session = undefined;
+    const opened = r4os.network_stream.Session.open(app, &budget, &network);
+    if (opened != 0) {
+        output.write("SEND: TCPSVC unavailable or invalid\r\n");
+        _ = output.close();
+        return 1;
+    }
+    const ctx: App = .{ .app = app, .sys = app.system(), .output = &output, .network = &network, .budget = &budget, .args = args, .family = selected_family };
+    const result = run(&ctx);
+    const closed = network.close();
+    if (closed != 0) output.write("SEND close: not confirmed\r\n");
+    const io_closed = output.close();
+    return if (output.failed or closed != 0 or io_closed != 0) 1 else result;
+}
+
+fn run(ctx: *const App) i32 {
+    const args = trim(ctx.args);
+    const options = parseOptions(ctx, args) orelse {
+        usage(ctx);
         return 1;
     };
 
@@ -113,7 +94,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     }
 
     const file_size: usize = @intCast(info.size);
-    const allocator = r4_app.allocator() orelse {
+    const allocator = ctx.app.allocator() orelse {
         ctx.write("SEND: snapshot memory unavailable\r\n");
         return 1;
     };
@@ -122,7 +103,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         return 1;
     };
     defer allocator.free(snapshot);
-    const sum = loadSnapshot(&ctx, path_z, snapshot) orelse {
+    const sum = loadSnapshot(ctx, path_z, snapshot) orelse {
         ctx.write("SEND read: failed or source size changed\r\n");
         return 1;
     };
@@ -137,7 +118,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         ctx.write("SEND resolved ");
         ctx.write(options.target_text);
         ctx.write(" to ");
-        writeIpv4(&ctx, options.target_ip);
+        writeAddress(ctx, options.target.address);
         ctx.write("\r\n");
     }
 
@@ -150,116 +131,86 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
             ctx.printU64(options.retries + 1);
             ctx.write("\r\n");
         }
-        const result = sendOnce(&ctx, options, snapshot, sum, header);
+        const result = sendOnce(ctx, options, snapshot, sum, header);
         if (result == 0) return 0;
+        if (ctx.network.cleanup_failed or ctx.output.failed) return 1;
+        if (result == 2 and !options.resume_mode) {
+            ctx.write("SEND retry: remote effect unconfirmed, use resume reconciliation\r\n");
+            return 1;
+        }
+        _ = ctx.budget.remainingTicks() catch return 1;
         if (attempt < options.retries) ctx.write("SEND retry: next\r\n");
     }
     return 1;
 }
 
 fn sendOnce(ctx: *const App, options: Options, snapshot: []const u8, sum: u32, header: []const u8) i32 {
-    const file_size = snapshot.len;
     ctx.write("SEND connect ");
-    writeIpv4(ctx, options.target_ip);
+    writeAddress(ctx, options.target.address);
     ctx.write(":");
     ctx.printU64(options.port);
     ctx.write(": ");
-    const conn = ctx.tcpConnectService(options.target_ip[0], options.target_ip[1], options.target_ip[2], options.target_ip[3], options.port);
-    if (conn <= 0) {
+    var socket: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(options.target, false, ctx.budget, &socket) != 0) {
         ctx.write("failed\r\n");
         return 1;
     }
+    defer socket.close();
     ctx.write("ok\r\n");
-
-    const conn_id: u32 = @intCast(conn);
-    const control_wait_ticks = ctx.ticksFromMilliseconds(CONTROL_WAIT_MS);
-
+    const sent_header = socket.writeAll(header, ctx.budget) catch return 2;
+    if (!r4os.network_stream.complete(sent_header)) {
+        ctx.write("SEND write: header-failed prefix=");
+        ctx.printU64(sent_header.bytes);
+        ctx.write("\r\n");
+        return 2;
+    }
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
     var offset: usize = 0;
-    var sent_from: usize = 0;
     if (options.resume_mode) {
-        const header_written = ctx.tcpWriteService(conn_id, header);
-        if (header_written < 0 or header_written != @as(i32, @intCast(header.len))) {
-            ctx.write("SEND write: header-failed\r\n");
-            _ = ctx.tcpCloseService(conn_id);
-            return 1;
-        }
-
         var control_buf: [96]u8 = undefined;
-        const got_control = ctx.tcpReadWaitService(conn_id, control_buf[0..], control_wait_ticks);
-        if (got_control <= 0) {
-            ctx.write("SEND resume: timeout\r\n");
-            _ = ctx.tcpCloseService(conn_id);
-            return 1;
-        }
-        const control = trim(control_buf[0..@intCast(got_control)]);
+        const control_raw = (reader.line(&control_buf, ctx.budget) catch return 2) orelse {
+            ctx.write("SEND resume: incomplete control\r\n");
+            return 2;
+        };
+        const control = trim(control_raw);
         ctx.write("SEND resume: ");
         ctx.write(control);
         ctx.write("\r\n");
         if (isAck(control)) {
-            const ack_info = parseAck(control, file_size, sum);
-            _ = ctx.tcpCloseService(conn_id);
+            const ack_info = parseAck(control, snapshot.len, sum);
             printAckResult(ctx, ack_info);
             return if (ack_info.ok) 0 else 1;
         }
         offset = parseContinue(control) orelse {
             ctx.write("SEND resume: bad-control\r\n");
-            _ = ctx.tcpCloseService(conn_id);
-            return 1;
+            return 2;
         };
-        if (offset > file_size) {
+        if (offset > snapshot.len) {
             ctx.write("SEND resume: offset-too-large\r\n");
-            _ = ctx.tcpCloseService(conn_id);
-            return 1;
+            return 2;
         }
         ctx.write("SEND resume offset: ");
         ctx.printU64(offset);
         ctx.write("\r\n");
-        sent_from = offset;
-    } else {
-        var first_buf: [MAX_TCP_CHUNK]u8 = undefined;
-        @memcpy(first_buf[0..header.len], header);
-        const prefix_cap = first_buf.len - header.len;
-        const prefix_len = @min(prefix_cap, file_size);
-        @memcpy(first_buf[header.len..][0..prefix_len], snapshot[0..prefix_len]);
-        const first_len = header.len + prefix_len;
-        const first_written = ctx.tcpWriteService(conn_id, first_buf[0..first_len]);
-        if (first_written < 0 or first_written != @as(i32, @intCast(first_len))) {
-            ctx.write("SEND write: header-failed\r\n");
-            _ = ctx.tcpCloseService(conn_id);
-            return 1;
-        }
-        offset = prefix_len;
     }
-
-    while (offset < file_size) {
-        const want = @min(MAX_TCP_CHUNK, file_size - offset);
-        const chunk = snapshot[offset..][0..want];
-        const written = ctx.tcpWritePacedService(conn_id, chunk, control_wait_ticks);
-        if (written < 0 or written != @as(i32, @intCast(chunk.len))) {
-            ctx.write("SEND write: failed offset=");
-            ctx.printU64(offset);
-            ctx.write("\r\n");
-            _ = ctx.tcpCloseService(conn_id);
-            return 1;
-        }
-        offset += chunk.len;
+    const sent = socket.writeAll(snapshot[offset..], ctx.budget) catch return 2;
+    if (!r4os.network_stream.complete(sent)) {
+        ctx.write("SEND write: failed offset=");
+        ctx.printU64(offset + sent.bytes);
+        ctx.write("\r\n");
+        return 2;
     }
-
-    printSent(ctx, options.remote_name, file_size, sent_from, sum);
-
+    printSent(ctx, options.remote_name, snapshot.len, offset, sum);
     var reply: [96]u8 = undefined;
-    const got = ctx.tcpReadWaitService(conn_id, reply[0..], control_wait_ticks);
-    _ = ctx.tcpCloseService(conn_id);
-    if (got <= 0) {
-        ctx.write("SEND ack: timeout\r\n");
-        return 1;
-    }
-
-    const ack = trim(reply[0..@intCast(got)]);
+    const ack_raw = (reader.line(&reply, ctx.budget) catch return 2) orelse {
+        ctx.write("SEND ack: unconfirmed\r\n");
+        return 2;
+    };
+    const ack = trim(ack_raw);
     ctx.write("SEND ack: ");
     ctx.write(ack);
     ctx.write("\r\n");
-    const ack_info = parseAck(ack, file_size, sum);
+    const ack_info = parseAck(ack, snapshot.len, sum);
     printAckResult(ctx, ack_info);
     return if (ack_info.ok) 0 else 1;
 }
@@ -298,7 +249,7 @@ fn printAckResult(ctx: *const App, ack_info: AckInfo) void {
 }
 
 fn usage(ctx: *const App) void {
-    ctx.write("Usage: SEND host port file [remote-name] [/RESUME] [/RETRY n]\r\n");
+    ctx.write("Usage: SEND [-4|-6] host port file [remote-name] [/RESUME] [/RETRY n]\r\n");
 }
 
 fn parseOptions(ctx: *const App, args: []const u8) ?Options {
@@ -329,26 +280,19 @@ fn parseOptions(ctx: *const App, args: []const u8) ?Options {
     }
 
     const port = parsePort(port_token.token) orelse return null;
-    var target_ip: [4]u8 = undefined;
-    var resolved = false;
-    if (parseIpv4(target.token)) |ip| {
-        target_ip = ip;
-    } else {
-        const result = ctx.netDnsResolveService(target.token, &target_ip);
-        if (result != r4os.abi.dns_result_ok) {
-            ctx.write("SEND resolve failed for ");
-            ctx.write(target.token);
-            ctx.write(": ");
-            ctx.write(ctx.netDnsResultName(result));
-            ctx.write("\r\n");
-            return null;
-        }
-        resolved = true;
+    var endpoint: r4os.abi.NetworkEndpoint = .{};
+    if (ctx.network.resolve(target.token, port, ctx.family, ctx.budget, &endpoint) != 0) {
+        ctx.write("SEND resolve failed for ");
+        ctx.write(target.token);
+        ctx.write("\r\n");
+        return null;
     }
+    const numeric = if (target.token.len >= 2 and target.token[0] == '[') target.token[1 .. target.token.len - 1] else target.token;
+    const resolved = r4os.network_family.parseAddress(numeric) == null;
 
     return .{
         .target_text = target.token,
-        .target_ip = target_ip,
+        .target = endpoint,
         .port = port,
         .path = file_token.token,
         .remote_name = remote_name orelse baseName(file_token.token),
@@ -427,7 +371,7 @@ fn parseContinue(value: []const u8) ?usize {
 fn validName(value: []const u8) bool {
     if (value.len == 0 or value.len > 48) return false;
     for (value) |ch| {
-        if (isSpace(ch) or ch == '/' or ch == '\\' or ch == ':') return false;
+        if (ch < 32 or ch == 127 or ch == '"' or isSpace(ch) or ch == '/' or ch == '\\' or ch == ':') return false;
     }
     return true;
 }
@@ -446,12 +390,20 @@ fn baseName(path: []const u8) []const u8 {
 // used by the header, all sends, retries and resume offsets.
 fn loadSnapshot(ctx: *const App, path: [*:0]const u8, snapshot: []u8) ?u32 {
     if (snapshot.len > MAX_FILE) return null;
-    if (snapshot.len != 0) {
-        const got = ctx.fileReadAt(path, 0, snapshot);
-        if (got < 0 or got != @as(i32, @intCast(snapshot.len))) return null;
-    }
-    const after = ctx.fileInfo(path) orelse return null;
-    if (after.is_dir != 0 or after.size != snapshot.len) return null;
+    const before = switch (r4os.metadata2.info(&ctx.app.context, path)) {
+        .found => |value| value,
+        else => return null,
+    };
+    if (before.flags & r4os.abi.file_metadata2_flag_byte_size_valid == 0 or before.byte_size != snapshot.len) return null;
+    var source = r4os.stream_transfer.adapters.FileRead.fromContext2(&ctx.app.context, path, 0) catch return null;
+    const driver: r4os.stream_transfer.adapters.Driver = .{ .sys = ctx.sys, .clock = &ctx.network.clock, .budget = ctx.budget };
+    const result = driver.read(snapshot, 16 * 1024, r4os.stream_transfer.adapters.FileRead.step, &source, true) catch return null;
+    if (!r4os.network_stream.complete(result)) return null;
+    const after = switch (r4os.metadata2.info(&ctx.app.context, path)) {
+        .found => |value| value,
+        else => return null,
+    };
+    if (!std.meta.eql(before, after)) return null;
     return checksumUpdate(0, snapshot);
 }
 
@@ -484,43 +436,26 @@ fn appendU64(out: []u8, len: *usize, value: u64) bool {
     return append(out, len, digits[digits.len - count ..]);
 }
 
-const Token = struct {
-    token: []const u8,
-    rest: []const u8,
-};
-
+const Token = struct { token: []const u8, rest: []const u8 };
 fn takeToken(value: []const u8) ?Token {
-    const trimmed = trim(value);
-    if (trimmed.len == 0) return null;
-    var end: usize = 0;
-    while (end < trimmed.len and !isSpace(trimmed[end])) : (end += 1) {}
-    return .{
-        .token = trimmed[0..end],
-        .rest = if (end >= trimmed.len) "" else trim(trimmed[end..]),
-    };
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(value, .{}, &failure) catch return null;
+    const token = (cursor.next() catch return null) orelse return null;
+    return .{ .token = token.bytes(value) catch return null, .rest = cursor.remainingArguments() catch return null };
 }
 
 fn parsePort(value: []const u8) ?u16 {
     if (value.len == 0) return null;
-    var out: u32 = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        out = out * 10 + @as(u32, ch - '0');
-        if (out == 0 or out > 65535) return null;
-    }
-    return @intCast(out);
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(u16, value, 10) catch return null;
+    return if (number == 0) null else number;
 }
 
 fn parseUsize(value: []const u8) ?usize {
     if (value.len == 0) return null;
-    var out: usize = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        const digit: usize = ch - '0';
-        if (out > (@import("std").math.maxInt(usize) - digit) / 10) return null;
-        out = out * 10 + digit;
-    }
-    return out;
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(usize, value, 10) catch return null;
+    return number;
 }
 
 fn parseU32(value: []const u8) ?u32 {
@@ -535,43 +470,9 @@ fn parseRetry(value: []const u8) ?u32 {
     return parsed;
 }
 
-fn parseIpv4(value: []const u8) ?[4]u8 {
-    var out: [4]u8 = .{0} ** 4;
-    var part: usize = 0;
-    var accum: u16 = 0;
-    var digits: usize = 0;
-
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const ch = value[index];
-        if (ch >= '0' and ch <= '9') {
-            accum = accum * 10 + @as(u16, ch - '0');
-            if (accum > 255) return null;
-            digits += 1;
-            if (digits > 3) return null;
-        } else if (ch == '.') {
-            if (digits == 0 or part >= 3) return null;
-            out[part] = @intCast(accum);
-            part += 1;
-            accum = 0;
-            digits = 0;
-        } else {
-            return null;
-        }
-    }
-    if (digits == 0 or part != 3) return null;
-    out[part] = @intCast(accum);
-    return out;
-}
-
-fn writeIpv4(ctx: *const App, ip: [4]u8) void {
-    ctx.printU64(ip[0]);
-    ctx.putc('.');
-    ctx.printU64(ip[1]);
-    ctx.putc('.');
-    ctx.printU64(ip[2]);
-    ctx.putc('.');
-    ctx.printU64(ip[3]);
+fn writeAddress(ctx: *const App, address: r4os.abi.NetworkAddress) void {
+    var buffer: [80]u8 = undefined;
+    ctx.write(r4os.network_family.addressText(&buffer, address) catch "unknown");
 }
 
 fn copyZ(out: [:0]u8, text: []const u8) ?[*:0]const u8 {
@@ -606,4 +507,14 @@ fn bytesEqual(a: []const u8, b: []const u8) bool {
         if (a[i] != b[i]) return false;
     }
     return true;
+}
+
+test "migration send control rejects incomplete ACK and bounds resume offsets" {
+    try std.testing.expect(parseAck("OK 123 456", 123, 456).ok);
+    try std.testing.expect(!parseAck("OK 123 45", 123, 456).ok);
+    try std.testing.expect(!parseAck("OK 123 456 trailing", 123, 456).ok);
+    try std.testing.expectEqual(@as(usize, 12), parseContinue("CONT 12").?);
+    try std.testing.expect(parseContinue("CONT 999999999999999999999999999") == null);
+    try std.testing.expect(!validName("bad\"name.bin"));
+    try std.testing.expect(validName("Grüße.bin"));
 }
