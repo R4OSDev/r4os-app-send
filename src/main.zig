@@ -179,7 +179,7 @@ fn sendOnce(ctx: *const App, options: Options, snapshot: []const u8, sum: u32, h
         if (isAck(control)) {
             const ack_info = parseAck(control, snapshot.len, sum);
             printAckResult(ctx, ack_info);
-            return if (ack_info.ok) 0 else 1;
+            return if (ack_info.ok) 0 else if (ack_info.confirmed_error) 1 else 2;
         }
         offset = parseContinue(control) orelse {
             ctx.write("SEND resume: bad-control\r\n");
@@ -212,7 +212,7 @@ fn sendOnce(ctx: *const App, options: Options, snapshot: []const u8, sum: u32, h
     ctx.write("\r\n");
     const ack_info = parseAck(ack, snapshot.len, sum);
     printAckResult(ctx, ack_info);
-    return if (ack_info.ok) 0 else 1;
+    return if (ack_info.ok) 0 else if (ack_info.confirmed_error) 1 else 2;
 }
 
 fn printSent(ctx: *const App, remote_name: []const u8, file_size: usize, sent_from: usize, sum: u32) void {
@@ -319,6 +319,7 @@ fn buildHeader(out: []u8, magic: []const u8, name_raw: []const u8, size: usize, 
 
 const AckInfo = struct {
     ok: bool = false,
+    confirmed_error: bool = false,
     code: []const u8 = "",
     saved: usize = 0,
     expected: usize = 0,
@@ -329,17 +330,13 @@ fn parseAck(value: []const u8, expected_size: usize, expected_sum: u32) AckInfo 
     const status = takeToken(rest) orelse return .{ .code = "empty-ack" };
     rest = status.rest;
     if (bytesEqual(status.token, "ERR")) {
-        const code = takeToken(rest) orelse return .{ .code = "remote-error" };
-        rest = code.rest;
-        const saved_token = takeToken(rest);
-        var saved: usize = 0;
-        var expected: usize = 0;
-        if (saved_token) |tok| {
-            saved = parseUsize(tok.token) orelse 0;
-            const expected_token = takeToken(tok.rest);
-            if (expected_token) |exp| expected = parseUsize(exp.token) orelse 0;
-        }
-        return .{ .code = code.token, .saved = saved, .expected = expected };
+        const code = takeToken(rest) orelse return .{ .code = "bad-ack" };
+        const saved_token = takeToken(code.rest) orelse return .{ .code = "bad-ack" };
+        const expected_token = takeToken(saved_token.rest) orelse return .{ .code = "bad-ack" };
+        if (expected_token.rest.len != 0) return .{ .code = "bad-ack" };
+        const saved = parseUsize(saved_token.token) orelse return .{ .code = "bad-ack" };
+        const expected = parseUsize(expected_token.token) orelse return .{ .code = "bad-ack" };
+        return .{ .confirmed_error = true, .code = code.token, .saved = saved, .expected = expected };
     }
     if (!bytesEqual(status.token, "OK")) return .{ .code = "bad-ack" };
     const size_token = takeToken(rest) orelse return .{ .code = "bad-ack" };
@@ -515,6 +512,9 @@ test "migration send control rejects incomplete ACK and bounds resume offsets" {
     try std.testing.expect(!parseAck("OK 123 456 trailing", 123, 456).ok);
     try std.testing.expectEqual(@as(usize, 12), parseContinue("CONT 12").?);
     try std.testing.expect(parseContinue("CONT 999999999999999999999999999") == null);
+    try std.testing.expect(parseAck("ERR save 12 123", 123, 456).confirmed_error);
+    try std.testing.expect(!parseAck("ERR save 12", 123, 456).confirmed_error);
+    try std.testing.expect(!parseAck("ERR save 12 nope", 123, 456).confirmed_error);
     try std.testing.expect(!validName("bad\"name.bin"));
     try std.testing.expect(validName("Grüße.bin"));
 }
